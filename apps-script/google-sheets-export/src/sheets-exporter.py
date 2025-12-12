@@ -4,13 +4,13 @@ from dotenv import load_dotenv
 load_dotenv()
 from google.oauth2.service_account import Credentials
 from sqlalchemy import create_engine, text
-import json
 import gspread
 import traceback
 from sqlalchemy.engine import Engine
 from google.oauth2 import service_account
 from typing import Tuple, List
 import uuid
+import yaml
 print("done")
 
 # --- config (from env) ---
@@ -21,13 +21,15 @@ POSTGRES_DB = os.environ.get("POSTGRES_DB")
 POSTGRES_USER = os.environ.get("POSTGRES_USER")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD")
 SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-SHEET_ID = "1QK8pN0gyuBm2sW_OkIn2O8Y-mzSxOAMn0yUX2pv8aOY"
-SHEET_NAME = "supplier_product_orders"
-SCHEMA_NAME = "google_sheets"
-TARGET_TABLE = "supplier_product_orders"
-# e.g., stg_supplier_product_orders
-STAGING_TABLE = f"{TARGET_TABLE}_stg"
+MAPPINGS_PATH = os.environ.get("MAPPINGS_YML", "mappings.yml")
 print("done")
+
+# --- mappings (from mappings.yml) ---
+with open(MAPPINGS_PATH, "r", encoding="utf-8") as f:
+    MAPPINGS = yaml.safe_load(f)
+
+if not isinstance(MAPPINGS, list) or not MAPPINGS:
+    raise RuntimeError("mappings.yml must contain a non-empty list at the top level.")
 
 # barkdb credentials
 def get_engine() -> Engine:
@@ -54,33 +56,6 @@ def get_gspread_client(scopes: List[str] = None):
     creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
     return gspread.authorize(creds)
 
-def test_postgres_connection():
-    print("testing postgres")
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            r = conn.execute(text("SELECT 1")).scalar()
-            print("postgres ok:", r)
-    except Exception as e:
-        print("postgres ERROR (v2):", repr(e))
-        traceback.print_exc()
-
-def test_gsheet_connection_v2(sheet_id: str = None):
-    print("testing google sheets (v2)...")
-    try:
-        gc = get_gspread_client()
-        print("test")
-        if sheet_id:
-            sh = gc.open_by_key(sheet_id)
-            print("gspread ok: opened spreadsheet:", sh.title)
-        else:
-            # lightweight check: list accessible spreadsheets (may be slow)
-            all_spreads = gc.openall()
-            print("gspread ok: accessible spreadsheets count:", len(all_spreads))
-    except Exception as e:
-        print("gsheets ERROR (v2):", repr(e))
-        traceback.print_exc()
-
 # read the data
 def read_sheet(sheet_id, sheet_name):
     gc = get_gspread_client()
@@ -89,7 +64,7 @@ def read_sheet(sheet_id, sheet_name):
     return rows, ws
 
 # Figure out which rows to insert and which to update, depending on whether they already have an internal_uuid
-def split_rows(rows, uuid_col="internal_uuid"):
+def split_rows(rows, uuid_col):
     inserts = []
     updates = []
     for r in rows:
@@ -106,24 +81,32 @@ def assign_uuids(rows, uuid_col="internal_uuid"):
         r[uuid_col] = str(uuid.uuid4())
     return rows
 
-# Create the staging table, all text. will ETL later
-def staging_table(engine, schema, table, rows):
-    if not rows:
-        return
-
-    cols = list(rows[0].keys())
-    # Add column processed_at
+def normalize_columns(cols):
+    """Return a list of normalized lowercase column names for DB."""
+    cols = [c.lower() for c in cols]
     if "processed_at" not in cols:
         cols.append("processed_at")
+    if "internal_uuid" not in cols:
+        cols.append("internal_uuid")
+    return cols
 
+
+def build_col_defs(cols):
+    """Build SQL column definitions based on normalized names."""
     col_defs = []
     for c in cols:
-        if c == "processed_at":
+        if c == "internal_uuid":
+            col_defs.append(f'"{c}" UUID PRIMARY KEY')
+        elif c == "processed_at":
             col_defs.append(f'"{c}" TIMESTAMPTZ')
-        elif c == "internal_uuid":
-            col_defs.append(f'"{c}" UUID')
         else:
             col_defs.append(f'"{c}" TEXT')
+    return col_defs
+
+# Create the staging table, all text. will ETL later
+def create_staging_table(engine, schema, table, cols):
+    cols = normalize_columns(cols)
+    col_defs = build_col_defs(cols)
 
     ddl = f"""
         DROP TABLE IF EXISTS {schema}."{table}";
@@ -135,7 +118,7 @@ def staging_table(engine, schema, table, rows):
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
         conn.execute(text(ddl))
 
-def delete_staging_table(engine, schema, table):
+def drop_table(engine, schema, table):
     ddl = f"""
         DROP TABLE IF EXISTS {schema}."{table}";
     """
@@ -169,24 +152,8 @@ def load_staging(engine, schema, table, rows, batch_size=300):
     print(f"loaded {len(rows)} rows into staging")
 
 def create_target_table_if_not_exists(engine, schema, table, cols):
-    """
-    Create target table if missing. internal_uuid becomes UUID PK; other cols TEXT.
-    """
-    if not isinstance(cols, (list, tuple)) or not cols:
-        raise TypeError("cols must be a non-empty list of column names")
-
-    if "internal_uuid" not in cols:
-        raise ValueError("internal_uuid must be present in cols")
-
-    col_defs = []
-
-    for c in cols:
-        if c == "internal_uuid":
-            col_defs.append(f'"{c}" UUID PRIMARY KEY')
-        elif c == "processed_at":
-            col_defs.append(f'"{c}" TIMESTAMPTZ')
-        else:
-            col_defs.append(f'"{c}" TEXT')
+    cols = normalize_columns(cols)
+    col_defs = build_col_defs(cols)
 
     ddl_schema = text(f'CREATE SCHEMA IF NOT EXISTS {schema};')
     ddl_table = text(f"""
@@ -223,7 +190,7 @@ def upsert_staging_into_target(engine, schema, staging, target, cols):
         result = conn.execute(text(sql))
         return [row[0] for row in result.fetchall()]
 
-def update_sheet_with_results(engine, worksheet, processed_uuids, uuid_col="internal_uuid", processed_col="processed_at", original_rows=None):
+def update_sheet_with_results(engine, worksheet, processed_uuids, schema, target_table, uuid_col, processed_col, original_rows=None):
        # defensive checks
     if processed_uuids is None or not isinstance(processed_uuids, (list, tuple)):
         raise ValueError("processed_uuids must be a list/tuple of uuid strings")
@@ -312,8 +279,8 @@ def update_sheet_with_results(engine, worksheet, processed_uuids, uuid_col="inte
     placeholders = ", ".join([f":u{i}" for i in range(len(uuids_tuple))])
     params = {f"u{i}": uuids_tuple[i] for i in range(len(uuids_tuple))}
     sql = text(f"""
-        SELECT internal_uuid::text AS internal_uuid, processed_at
-        FROM {SCHEMA_NAME}."{TARGET_TABLE}"
+        SELECT {uuid_col}::text AS internal_uuid, {processed_col}
+        FROM {schema}."{target_table}"
         WHERE internal_uuid IN ({placeholders})
     """)
     uuid_to_processed = {}
@@ -340,81 +307,98 @@ def update_sheet_with_results(engine, worksheet, processed_uuids, uuid_col="inte
     processed_range = gspread.utils.rowcol_to_a1(start_row, processed_idx) + ":" + gspread.utils.rowcol_to_a1(end_row, processed_idx)
 
     worksheet.update(
-        uuid_range,
-        internal_uuid_column_values,
+        values=internal_uuid_column_values,
+        range_name=uuid_range,
         value_input_option="RAW"
     )
 
-    # Write processed_at
     worksheet.update(
-        processed_range,
-        processed_col_values,
+        values=processed_col_values,
+        range_name=processed_range,
         value_input_option="RAW"
     )
 
     print(f"Sheet updated: wrote {len(final_uuids)} internal_uuid and processed_at values.")
 
-def testing ():
-    print("running connection tests")
-    test_postgres_connection()
-    test_gsheet_connection_v2(SHEET_ID)
-    print("connection tests finished")
-
 def main():
     eng = get_engine()
 
-    # get sheet rows AND worksheet object
-    rows, worksheet = read_sheet(SHEET_ID, SHEET_NAME)
-    print("total rows:", len(rows))
-    print("sample row:", rows[0] if rows else None)
+    for m in MAPPINGS:
+        name = m.get("name") or f"mapping_{m.get('sheet_name')}"
+        sheet_id = m.get("sheet_id")
+        sheet_name = m.get("sheet_name")
+        schema = m.get("schema")
+        target_table = m.get("target_table")
+        staging_table = m.get("staging_table") or f"{target_table}_stg"
+        uuid_col = m.get("uuid_col", "internal_uuid")
+        processed_col = m.get("processed_col", "processed_at")
 
-    # split and assign UUIDs
-    ins, upd = split_rows(rows)
-    ins = assign_uuids(ins)
-    print("updates:", len(upd))
-    print("inserts:", len(ins))
-    all_rows = upd + ins
-    print("Staging payload", len(all_rows))
+        if not sheet_name or not target_table:
+            print(f"[{name}] skipping invalid mapping (missing sheet_name or target_table): {m}")
+            continue
 
-    # derive cols from headers (safer than rows[0].keys())
-    headers = worksheet.row_values(1)
-    # sanitize: strip BOM/extra spaces
-    cols = [ (h.strip().lstrip("\ufeff") or f"_col_{i}") for i,h in enumerate(headers, start=1) ]
-    if "internal_uuid" not in cols:
-        # ensure pk present
-        cols.append("internal_uuid")
-    if "processed_at" not in cols:
-        # ensure pk present
-        cols.append("processed_at")
+        print(f"[{name}] Processing: sheet '{sheet_name}' -> {schema}.{target_table}")
 
-    # create & load staging
-    staging_table(eng, SCHEMA_NAME, STAGING_TABLE, all_rows)
-    load_staging(eng, SCHEMA_NAME, STAGING_TABLE, all_rows)
+        try:
+            rows, worksheet = read_sheet(sheet_id, sheet_name)
+        except Exception as e:
+            print(f"[{name}] Failed to read sheet '{sheet_name}': {e}")
+            traceback.print_exc()
+            continue
 
-    # create target table if missing
-    create_target_table_if_not_exists(eng, SCHEMA_NAME, TARGET_TABLE, cols)
+         # print summary
+        print("total rows:", len(rows))
+        print("sample row:", rows[0] if rows else None)
 
-    # # STEP 6 → 7: upsert, then update sheet ONLY if upsert succeeds
-    try:
-        processed_uuids = upsert_staging_into_target(
-            eng,
-            SCHEMA_NAME,
-            STAGING_TABLE,
-            TARGET_TABLE,
-            cols
-        )
-        print("Upsert successful, proceeding to update sheet.")
-        # update sheet using the rows we already read (avoid another read)
-        update_sheet_with_results(eng, worksheet, processed_uuids, original_rows=rows)
-        print("Sheet updated. Proceeding to drop staging table")
-        # delete staging table
-        delete_staging_table(eng, SCHEMA_NAME, STAGING_TABLE)
+        # read header row (do NOT overwrite `rows`)
+        header_row = worksheet.row_values(1)
+        cols = [ (h.strip().lstrip("\ufeff") or f"_col_{i}") for i,h in enumerate(header_row, start=1) ]
+        # ensure mapping uuid/processed columns exist in final schema
+        if uuid_col not in cols:
+            cols.append(uuid_col)
+        if processed_col not in cols:
+            cols.append(processed_col)
 
-    except Exception as e:
-        print("Upsert failed. Sheet will NOT be updated.")
-        print("Error:", e)
-        traceback.print_exc()
-        return
+        drop_table(eng, schema, target_table)
+        # create empty staging table from headers even if no data rows
+        create_staging_table(eng, schema, staging_table, cols)
+
+        # split and assign UUIDs (still use the rows dicts)
+        ins, upd = split_rows(rows, uuid_col)
+        ins = assign_uuids(ins, uuid_col)
+        print("updates:", len(upd))
+        print("inserts:", len(ins))
+        all_rows = upd + ins
+        print("Staging payload", len(all_rows))
+
+        # load staging (will no-op if all_rows is empty)
+        load_staging(eng, schema, staging_table, all_rows)
+
+        # create target table if missing
+        create_target_table_if_not_exists(eng, schema, target_table, cols)
+
+        # upsert, then update sheet ONLY if upsert succeeds
+        try:
+            processed_uuids = upsert_staging_into_target(
+                eng,
+                schema,
+                staging_table,
+                target_table,
+                cols
+            )
+            print("Upsert successful, proceeding to update sheet.")
+
+            # update sheet using the rows we already read (avoid another read)
+            update_sheet_with_results(eng, worksheet, processed_uuids, schema, target_table, uuid_col, processed_col, original_rows=rows)
+            print("Sheet updated. Proceeding to drop staging table")
+            # delete staging table
+            drop_table(eng, schema, staging_table)
+
+        except Exception as e:
+            print("Upsert failed. Sheet will NOT be updated.")
+            print("Error:", e)
+            traceback.print_exc()
+            return
 
 main()
 

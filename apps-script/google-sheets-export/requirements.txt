@@ -3,3 +3,4 @@ gspread==6.2.1
 google-auth==2.41.1
 SQLAlchemy==2.0.44
 psycopg2-binary==2.9.11
+PyYAML
