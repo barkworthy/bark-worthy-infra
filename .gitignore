@@ -1,4 +1,4 @@
 node_modules/
 .env
 .DS_Store
-.apps-script/.clasp.json
+.apps-script/google-sheets-export/.secrets/service-account.json
