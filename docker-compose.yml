@@ -33,7 +33,20 @@ services:
       barknet:
         aliases:
          - metabase
-        
+
+  sheets_exporter:
+    build: ./apps-script/google-sheets-export
+    image: infra-sheets-exporter:1.0
+    env_file:
+      - ./.env
+    working_dir: /app
+    # which files to mount into the docker container
+    volumes:
+      - ./apps-script/google-sheets-export/src:/app/src
+      - ./apps-script/google-sheets-export/.secrets/service-account.json:/app/.secrets/service-account.json:ro
+    command: python ./src/sheets_exporter.py
+    networks:
+      - barknet
 
 volumes:
   pg_data:
