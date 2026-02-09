@@ -34,7 +34,7 @@ services:
         aliases:
          - metabase
 
-  sheets-exporter:
+  sheets_exporter:
     build: ./apps-script/google-sheets-export
     image: infra-sheets-exporter:1.0
     env_file:
@@ -44,7 +44,7 @@ services:
     volumes:
       - ./apps-script/google-sheets-export/src:/app/src
       - ./apps-script/google-sheets-export/.secrets/service-account.json:/app/.secrets/service-account.json:ro
-    command: python ./src/sheets-exporter.py
+    command: python ./src/sheets_exporter.py
     networks:
       - barknet
 

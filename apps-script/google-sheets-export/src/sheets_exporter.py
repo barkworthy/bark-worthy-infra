@@ -11,6 +11,9 @@ from google.oauth2 import service_account
 from typing import Tuple, List
 import uuid
 import yaml
+import warnings
+import re
+from typing import Iterable, List, Union
 print("done")
 
 # --- config (from env) ---
@@ -21,14 +24,19 @@ POSTGRES_DB = os.environ.get("POSTGRES_DB")
 POSTGRES_USER = os.environ.get("POSTGRES_USER")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD")
 SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-MAPPINGS_PATH = os.environ.get("MAPPINGS_YML", "mappings.yml")
+MODULE_DIR = os.path.dirname(__file__)
+MAPPINGS_PATH = os.path.join(MODULE_DIR, "mappings.yml")
 print("done")
 
-# --- mappings (from mappings.yml) ---
-with open(MAPPINGS_PATH, "r", encoding="utf-8") as f:
-    MAPPINGS = yaml.safe_load(f)
+# --- when loading the file, guard for missing file ---
+try:
+    with open(MAPPINGS_PATH, "r", encoding="utf-8") as f:
+        MAPPINGS = yaml.safe_load(f)
+except FileNotFoundError:
+    warnings.warn("mappings.yml not found — continuing with empty mappings (tests/CI).")
+    MAPPINGS = []
 
-if not isinstance(MAPPINGS, list) or not MAPPINGS:
+if not isinstance(MAPPINGS, list) or len(MAPPINGS) == 0:
     raise RuntimeError("mappings.yml must contain a non-empty list at the top level.")
 
 # barkdb credentials
@@ -59,16 +67,29 @@ def get_gspread_client(scopes: List[str] = None):
 # read the data
 def read_sheet(sheet_id, sheet_name):
     gc = get_gspread_client()
-    ws = gc.open_by_key(sheet_id).worksheet(sheet_name)
-    rows = ws.get_all_records()   # dicts, header row auto-handled
-    return rows, ws
+    import time
+    import random
+
+    for attempt in range(7):
+        try:
+            ws = gc.open_by_key(sheet_id).worksheet(sheet_name)
+            rows = ws.get_all_records()
+            return rows, ws
+
+        except Exception as e:
+            if "429" in str(e):
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"[{sheet_name}] Hit Google rate limit. Sleeping {wait:.1f}s then retrying...")
+                time.sleep(wait)
+                continue
+            raise
 
 # Figure out which rows to insert and which to update, depending on whether they already have an internal_uuid
 def split_rows(rows, uuid_col):
     inserts = []
     updates = []
     for r in rows:
-        uid = r.get(uuid_col, "").strip()
+        uid = (r.get(uuid_col) or "").strip()
         if uid:
             updates.append(r)
         else:
@@ -81,14 +102,40 @@ def assign_uuids(rows, uuid_col="internal_uuid"):
         r[uuid_col] = str(uuid.uuid4())
     return rows
 
-def normalize_columns(cols):
-    """Return a list of normalized lowercase column names for DB."""
-    cols = [c.lower() for c in cols]
-    if "processed_at" not in cols:
-        cols.append("processed_at")
-    if "internal_uuid" not in cols:
-        cols.append("internal_uuid")
-    return cols
+def normalize_columns(cols: Union[str, Iterable[str]]) -> Union[str, List[str]]:
+    def _norm(c: str) -> str:
+        s = str(c).strip().lower()
+        s = re.sub(r'[^a-z0-9]+', '_', s)
+        s = re.sub(r'_+', '_', s).strip('_')
+        return s
+
+    # single string
+    if isinstance(cols, str):
+        return _norm(cols)
+
+    # iterable
+    if isinstance(cols, Iterable):
+        normalized = []
+        seen = {}
+
+        for c in cols:
+            if c is None:
+                continue
+
+            new = _norm(c)
+            normalized.append(new)
+
+            # detect collisions
+            if new in seen:
+                raise RuntimeError(
+                    f"Column name collision after normalization: "
+                    f"'{seen[new]}' and '{c}' → '{new}'"
+                )
+            seen[new] = c
+
+        return normalized
+
+    raise TypeError("normalize_columns expects a string or iterable")
 
 
 def build_col_defs(cols):
@@ -102,6 +149,45 @@ def build_col_defs(cols):
         else:
             col_defs.append(f'"{c}" TEXT')
     return col_defs
+
+def get_table_columns(engine, schema, table):
+    # Get all columns from the target table. Will be used later to determine if Gsheet has new/dropped columns.
+    sql = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = :schema
+        AND table_name = :table
+        ORDER BY ordinal_position
+    """
+    with engine.connect() as conn:
+        res = conn.execute(text(sql), {"schema": schema, "table": table})
+        return [r[0] for r in res.fetchall()]
+
+def add_new_columns(engine, schema, table, new_cols):
+    # Add new column to target (for if Gsheet has new columns)
+    if not new_cols:
+        return
+
+    with engine.begin() as conn:
+        for c in new_cols:
+            print(f"[{table}] Adding new column: {c}")
+            conn.execute(text(
+                f'ALTER TABLE {schema}."{table}" ADD COLUMN "{c}" TEXT'
+            ))
+
+def inject_missing_columns(rows, missing_cols, table_name):
+    # For when Gsheet no longer has some columns, that still exist in the target table
+    if not missing_cols:
+        return rows
+
+    for c in missing_cols:
+        print(f"[{table_name}] WARNING: column '{c}' exists in DB but not in sheet. Filling NULLs.")
+
+    for r in rows:
+        for c in missing_cols:
+            r[c] = None
+
+    return rows
 
 # Create the staging table, all text. will ETL later
 def create_staging_table(engine, schema, table, cols):
@@ -172,25 +258,73 @@ def upsert_staging_into_target(engine, schema, staging, target, cols):
         raise TypeError("cols must be a list/tuple of column names")
     if "internal_uuid" not in cols:
         raise ValueError("cols must include 'internal_uuid'")
+    if "processed_at" not in cols:
+        raise ValueError("cols must include 'processed_at'")
 
     col_list = ", ".join([f'"{c}"' for c in cols])
     pk = "internal_uuid"
-    update_assignments = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in cols if c != pk])
+    compare_cols = [c for c in cols if c not in (pk, "processed_at")]
+
+    update_assignments = ", ".join(
+        [f'"{c}" = EXCLUDED."{c}"' for c in cols if c != pk]
+    )
+
+    change_conditions = " OR ".join(
+        [f'target."{c}" IS DISTINCT FROM EXCLUDED."{c}"' for c in compare_cols]
+    )
 
     sql = f"""
-        INSERT INTO {schema}."{target}" ({col_list})
-        SELECT {col_list}
-        FROM {schema}."{staging}"
-        ON CONFLICT ("{pk}") DO UPDATE SET
-            {update_assignments}
-        RETURNING "{pk}";
+        WITH upserted AS (
+            INSERT INTO {schema}."{target}" AS target ({col_list})
+            SELECT {col_list}
+            FROM {schema}."{staging}"
+            ON CONFLICT ("{pk}") DO UPDATE SET
+                {update_assignments}
+            WHERE {change_conditions}
+            RETURNING
+                "{pk}",
+                (xmax = 0) AS inserted
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE inserted) AS inserted,
+            COUNT(*) FILTER (WHERE NOT inserted) AS updated
+        FROM upserted;
     """
 
     with engine.begin() as conn:
-        result = conn.execute(text(sql))
-        return [row[0] for row in result.fetchall()]
+        # print("COMPARE COLS:", compare_cols)
+        # print("FIRST STAGING ROW:")
+        # print(conn.execute(text(f'SELECT * FROM {schema}."{staging}" LIMIT 1')).fetchone())
+        # print("FIRST TARGET ROW:")
+        # print(conn.execute(text(f'SELECT * FROM {schema}."{target}" LIMIT 1')).fetchone())
 
-def update_sheet_with_results(engine, worksheet, processed_uuids, schema, target_table, uuid_col, processed_col, original_rows=None):
+        result = conn.execute(text(sql)).fetchone()
+
+        inserted = result[0] or 0
+        updated = result[1] or 0
+
+        total = conn.execute(
+            text(f'SELECT COUNT(*) FROM {schema}."{staging}"')
+        ).scalar()
+
+        unchanged = total - (inserted + updated)
+
+        # fetch all uuids from staging for sheet update
+        uuid_rows = conn.execute(
+            text(f'SELECT "{pk}" FROM {schema}."{staging}"')
+        ).fetchall()
+
+        processed_uuids = [r[0] for r in uuid_rows]
+
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "unchanged": unchanged,
+            "processed_uuids": processed_uuids,
+        }
+
+def update_sheet_with_results(engine, worksheet, processed_uuids, schema, target_table, uuid_col, processed_col, insert_count, update_count, original_rows=None):
+
        # defensive checks
     if processed_uuids is None or not isinstance(processed_uuids, (list, tuple)):
         raise ValueError("processed_uuids must be a list/tuple of uuid strings")
@@ -202,12 +336,6 @@ def update_sheet_with_results(engine, worksheet, processed_uuids, schema, target
 
     # add missing header columns to the sheet (append to end)
     header_modified = False
-    if uuid_col not in headers:
-        headers.append(uuid_col)
-        header_modified = True
-    if processed_col not in headers:
-        headers.append(processed_col)
-        header_modified = True
     if header_modified:
         # write full header back (safe: small operation)
         worksheet.update("1:1", [headers])
@@ -318,7 +446,9 @@ def update_sheet_with_results(engine, worksheet, processed_uuids, schema, target
         value_input_option="RAW"
     )
 
-    print(f"Sheet updated: wrote {len(final_uuids)} internal_uuid and processed_at values.")
+    print("Sheet updated:")
+    print(f"internal_uuid written: {insert_count}")
+    print(f"processed_at updated: {update_count}")
 
 def main():
     eng = get_engine()
@@ -341,6 +471,30 @@ def main():
 
         try:
             rows, worksheet = read_sheet(sheet_id, sheet_name)
+            # --- normalize sheet column names ---
+            if rows:
+                original_cols = list(rows[0].keys())
+                normalized_cols = normalize_columns(original_cols)
+
+                col_map = dict(zip(original_cols, normalized_cols))
+
+                # warn if anything changed
+                changed = [(o, n) for o, n in col_map.items() if o != n]
+                if changed:
+                    print(f"[{name}] WARNING: non-snake-case columns detected:")
+                    for o, n in changed:
+                        print(f"    {o} -> {n}")
+
+                # apply normalization to each row
+                new_rows = []
+                for r in rows:
+                    new_r = {}
+                    for k, v in r.items():
+                        new_k = col_map.get(k, k)
+                        new_r[new_k] = v
+                    new_rows.append(new_r)
+
+                rows = new_rows
         except Exception as e:
             print(f"[{name}] Failed to read sheet '{sheet_name}': {e}")
             traceback.print_exc()
@@ -348,26 +502,58 @@ def main():
 
          # print summary
         print("total rows:", len(rows))
-        print("sample row:", rows[0] if rows else None)
+        #print("sample row:", rows[0] if rows else None)
 
         # read header row (do NOT overwrite `rows`)
         header_row = worksheet.row_values(1)
-        cols = [ (h.strip().lstrip("\ufeff") or f"_col_{i}") for i,h in enumerate(header_row, start=1) ]
-        # ensure mapping uuid/processed columns exist in final schema
+        raw_cols = [(h.strip().lstrip("\ufeff") or f"_col_{i}") for i, h in enumerate(header_row, start=1)]
+        cols = normalize_columns(raw_cols)
+
+        # ensure uuid + processed columns exist in schema list
         if uuid_col not in cols:
             cols.append(uuid_col)
         if processed_col not in cols:
             cols.append(processed_col)
 
-        drop_table(eng, schema, target_table)
+        # get existing DB columns (if table exists)
+        existing_cols = get_table_columns(eng, schema, target_table)
+
+        if not existing_cols:
+            # table doesn't exist yet → normal creation path
+            final_cols = cols
+        else:
+            sheet_cols = set(cols)
+            db_cols = set(existing_cols)
+
+            new_cols = sheet_cols - db_cols
+            missing_cols = db_cols - sheet_cols
+
+            # add new columns to DB
+            add_new_columns(eng, schema, target_table, new_cols)
+
+            # inject NULLs for removed columns
+            rows = inject_missing_columns(rows, missing_cols, target_table)
+
+            # final column set = union
+            final_cols = list(db_cols.union(sheet_cols))
+
+        # ensure mapping uuid/processed columns exist in final schema
+        if uuid_col not in final_cols:
+            final_cols.append(uuid_col)
+        if processed_col not in final_cols:
+            final_cols.append(processed_col)
+
+        # only for testing
+        # drop_table(eng, schema, target_table)
+
         # create empty staging table from headers even if no data rows
-        create_staging_table(eng, schema, staging_table, cols)
+        create_staging_table(eng, schema, staging_table, final_cols)
 
         # split and assign UUIDs (still use the rows dicts)
         ins, upd = split_rows(rows, uuid_col)
         ins = assign_uuids(ins, uuid_col)
-        print("updates:", len(upd))
-        print("inserts:", len(ins))
+        # print("updates:", len(upd))
+        # print("inserts:", len(ins))
         all_rows = upd + ins
         print("Staging payload", len(all_rows))
 
@@ -375,32 +561,59 @@ def main():
         load_staging(eng, schema, staging_table, all_rows)
 
         # create target table if missing
-        create_target_table_if_not_exists(eng, schema, target_table, cols)
+        create_target_table_if_not_exists(eng, schema, target_table, final_cols)
 
         # upsert, then update sheet ONLY if upsert succeeds
         try:
-            processed_uuids = upsert_staging_into_target(
+            res = upsert_staging_into_target(
                 eng,
                 schema,
                 staging_table,
                 target_table,
-                cols
+                final_cols
             )
-            print("Upsert successful, proceeding to update sheet.")
+            processed_uuids = res["processed_uuids"]
 
-            # update sheet using the rows we already read (avoid another read)
-            update_sheet_with_results(eng, worksheet, processed_uuids, schema, target_table, uuid_col, processed_col, original_rows=rows)
-            print("Sheet updated. Proceeding to drop staging table")
-            # delete staging table
-            drop_table(eng, schema, staging_table)
+            print(f"[{target_table}]")
+            print(f"inserted: {res['inserted']}")
+            print(f"updated: {res['updated']}")
+            print(f"unchanged: {res['unchanged']}")
+
 
         except Exception as e:
-            print("Upsert failed. Sheet will NOT be updated.")
+            print("Target upsert failed. Sheet will NOT be updated.")
             print("Error:", e)
             traceback.print_exc()
             return
 
-main()
+        try:
+            # update sheet using the rows we already read (avoid another read)
+            update_sheet_with_results(
+                eng,
+                worksheet,
+                processed_uuids,
+                schema,
+                target_table,
+                uuid_col,
+                processed_col,
+                insert_count=res["inserted"],
+                update_count=res["updated"],
+                original_rows=rows
+            )
+            print("Sheet updated. Proceeding to drop staging table")
+            # delete staging table
+            drop_table(eng, schema, staging_table)
+        except Exception as e:
+            print("Sheet update failed")
+            print("Error:", e)
+            traceback.print_exc()
+            return
 
-# docker compose build sheets-exporter
-# docker compose run --rm sheets-exporter
+if __name__ == "__main__":
+    main()
+
+# make sure you cd into Infra
+# docker compose build sheets_exporter
+# docker compose run --rm sheets_exporter
+
+# to test: pytest -v
