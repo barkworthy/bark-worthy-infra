@@ -8,6 +8,8 @@ on:
 
 jobs:
   test:
+    name: Unit tests
+
     runs-on: ubuntu-latest
 
     steps:
@@ -21,10 +23,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r apps-script/google-sheets-export/requirements.txt
+          pip install -r requirements-dev.txt
           pip install pytest
 
       - name: Run tests
         run: |
-          cd apps-script/google-sheets-export
           pytest -v
