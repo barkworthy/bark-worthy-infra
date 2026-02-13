@@ -14,6 +14,7 @@ import yaml
 import warnings
 import re
 from typing import Iterable, List, Union
+from psycopg2.extras import Json
 print("done")
 
 # --- config (from env) ---
@@ -212,7 +213,7 @@ def drop_table(engine, schema, table):
         conn.execute(text(ddl))
 
 # Load data into staging table
-def load_staging(engine, schema, table, rows, batch_size=300):
+def load_staging(engine, schema, target_table, staging_table, rows, batch_size=300):
     if not rows:
         print("no rows to load into staging")
         return
@@ -221,7 +222,7 @@ def load_staging(engine, schema, table, rows, batch_size=300):
     quoted_cols = ", ".join([f"\"{c}\"" for c in cols])
     placeholders = ", ".join([f":{c}" for c in cols])
     insert_sql = text(
-        f"INSERT INTO {schema}.\"{table}\" ({quoted_cols}, processed_at) VALUES ({placeholders}, NOW())"
+        f"INSERT INTO {schema}.\"{staging_table}\" ({quoted_cols}, processed_at) VALUES ({placeholders}, NOW())"
     )
 
     # Remove processed_at from each dict so DB can fill it
@@ -230,12 +231,12 @@ def load_staging(engine, schema, table, rows, batch_size=300):
             r.pop("processed_at")
 
     with engine.begin() as conn:
-        conn.execute(text(f"TRUNCATE {schema}.\"{table}\""))
+        conn.execute(text(f"TRUNCATE {schema}.\"{staging_table}\""))
         for i in range(0, len(rows), batch_size):
             batch = rows[i:i+batch_size]
             conn.execute(insert_sql, batch)
 
-    print(f"loaded {len(rows)} rows into staging")
+    print(f"[{target_table}] Loaded {len(rows)} rows into staging")
 
 def create_target_table_if_not_exists(engine, schema, table, cols):
     cols = normalize_columns(cols)
@@ -446,9 +447,142 @@ def update_sheet_with_results(engine, worksheet, processed_uuids, schema, target
         value_input_option="RAW"
     )
 
-    print("Sheet updated:")
-    print(f"internal_uuid written: {insert_count}")
-    print(f"processed_at updated: {update_count}")
+    print(f"[{target_table}] Sheet updated")
+    print(f"[{target_table}] Internal_uuid written: {insert_count}")
+    print(f"[{target_table}] Processed_at updated: {update_count}")
+
+def create_deleted_log_table_if_not_exists(engine, schema):
+    create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {schema}.deleted_rows_log (
+            internal_uuid UUID,
+            table_name TEXT,
+            deleted_timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            deleted_row_json JSONB
+        );
+    """
+
+    create_index_sql = f"""
+        CREATE INDEX IF NOT EXISTS idx_deleted_uuid_table
+        ON {schema}.deleted_rows_log (internal_uuid, table_name);
+    """
+
+    with engine.begin() as conn:
+        conn.execute(text(create_table_sql))
+        conn.execute(text(create_index_sql))
+
+def handle_deleted_rows(engine, schema, target_table, sheet_uuids):
+    # ---- SAFETY: if sheet has zero uuids, do NOT delete anything ----
+    if not sheet_uuids:
+        raise RuntimeError(
+            f"[{target_table}] Sheet returned zero UUIDs. "
+            f"Aborting deletion logic — possible sheet wipe or read failure."
+        )
+
+    """
+    If a uuid exists in target but not in sheet:
+    - copy full row to deleted_rows_log
+    - delete from target
+    """
+
+    create_deleted_log_table_if_not_exists(engine, schema)
+
+    with engine.begin() as conn:
+
+        # get target uuids
+        res = conn.execute(text(f'''
+            SELECT internal_uuid
+            FROM {schema}."{target_table}"
+        '''))
+        target_uuids = {str(r[0]) for r in res.fetchall() if r[0]}
+
+        sheet_uuid_set = {str(u) for u in sheet_uuids if u}
+
+        if not sheet_uuid_set:
+            raise RuntimeError(
+                f"[{target_table}] No valid UUIDs found in sheet. "
+                f"Aborting deletion logic."
+            )
+
+        to_delete = target_uuids - sheet_uuid_set
+        if len(to_delete) > 20:
+            print(f"[{target_table}] WARNING: large deletion detected ({len(to_delete)} rows)")
+
+        if not to_delete:
+            print(f"[{target_table}] No deleted rows detected.")
+            return {"deleted": 0}
+
+        print(f"[{target_table}] Found rows deleted from sheet: {len(to_delete)}")
+
+        # fetch full rows to archive
+        placeholders = ", ".join([f":u{i}" for i in range(len(to_delete))])
+        params = {f"u{i}": u for i, u in enumerate(to_delete)}
+
+        fetch_sql = text(f'''
+            SELECT *
+            FROM {schema}."{target_table}"
+            WHERE internal_uuid IN ({placeholders})
+        ''')
+
+        rows = conn.execute(fetch_sql, params).mappings().all()
+
+        rows = conn.execute(fetch_sql, params).mappings().all()
+
+        if len(rows) != len(to_delete):
+            raise RuntimeError(
+                f"[{target_table}] Archive mismatch. "
+                f"Expected {len(to_delete)} rows but fetched {len(rows)}. Aborting delete."
+            )
+
+        # ---------- make JSON safe ----------
+        import datetime
+
+        def make_json_safe(v):
+            if isinstance(v, uuid.UUID):
+                return str(v)
+            if isinstance(v, datetime.datetime):
+                return v.isoformat()
+            return v
+
+        archive_payload = []
+
+        for r in rows:
+            safe_row = {k: make_json_safe(v) for k, v in dict(r).items()}
+            archive_payload.append({
+                "uuid": str(r["internal_uuid"]),
+                "table": target_table,
+                "row_json": Json(safe_row)
+            })
+
+        # ---------- archive FIRST ----------
+        insert_sql = text(f'''
+            INSERT INTO {schema}.deleted_rows_log
+            (internal_uuid, table_name, deleted_timestamp, deleted_row_json)
+            VALUES (:uuid, :table, CURRENT_TIMESTAMP, :row_json)
+        ''')
+
+        conn.execute(insert_sql, archive_payload)
+
+        print(f"[{target_table}] Archived rows:", len(archive_payload))
+
+        # ---------- THEN delete ----------
+        delete_sql = text(f'''
+            DELETE FROM {schema}."{target_table}"
+            WHERE internal_uuid IN ({placeholders})
+        ''')
+
+        conn.execute(delete_sql, params)
+
+        # insert into deleted log
+        insert_sql = text(f'''
+            INSERT INTO {schema}.deleted_rows_log
+            (internal_uuid, table_name, deleted_timestamp, deleted_row_json)
+            VALUES (:uuid, :table, CURRENT_TIMESTAMP, :row_json)
+        ''')
+
+        print(f"[{target_table}] Deleted rows moved to deleted_rows_log.")
+
+        deleted_count = len(to_delete)
+        return {"deleted": deleted_count}
 
 def main():
     eng = get_engine()
@@ -501,11 +635,22 @@ def main():
             continue
 
          # print summary
-        print("total rows:", len(rows))
+        print(f"[{name}] total rows:", len(rows))
         #print("sample row:", rows[0] if rows else None)
 
         # read header row (do NOT overwrite `rows`)
         header_row = worksheet.row_values(1)
+
+        clean_headers = [h.strip() for h in header_row]
+
+        blank_cols = [i+1 for i,h in enumerate(clean_headers) if not h]
+
+        if blank_cols:
+            raise RuntimeError(
+                f"[{target_table}] Blank column headers detected at positions: {blank_cols}. "
+                f"All columns must have names."
+            )
+
         raw_cols = [(h.strip().lstrip("\ufeff") or f"_col_{i}") for i, h in enumerate(header_row, start=1)]
         cols = normalize_columns(raw_cols)
 
@@ -552,16 +697,40 @@ def main():
         # split and assign UUIDs (still use the rows dicts)
         ins, upd = split_rows(rows, uuid_col)
         ins = assign_uuids(ins, uuid_col)
-        # print("updates:", len(upd))
-        # print("inserts:", len(ins))
+
+        original_sheet_uuids = [r.get(uuid_col) for r in upd if r.get(uuid_col)]
+
         all_rows = upd + ins
-        print("Staging payload", len(all_rows))
+        print(f"[{target_table}] Staging payload", len(all_rows))
 
         # load staging (will no-op if all_rows is empty)
-        load_staging(eng, schema, staging_table, all_rows)
+        load_staging(eng, schema, target_table, staging_table, all_rows)
 
         # create target table if missing
         create_target_table_if_not_exists(eng, schema, target_table, final_cols)
+
+
+        new_uuids = [r[uuid_col] for r in ins if r.get(uuid_col)]
+
+        if new_uuids:
+            placeholders = ", ".join([f":u{i}" for i in range(len(new_uuids))])
+            params = {f"u{i}": u for i, u in enumerate(new_uuids)}
+
+            sql = text(f'''
+                SELECT internal_uuid
+                FROM {schema}."{target_table}"
+                WHERE internal_uuid IN ({placeholders})
+            ''')
+
+            with eng.connect() as conn:
+                existing = conn.execute(sql, params).fetchall()
+
+            if existing:
+                raise RuntimeError(
+                    f"[{target_table}] UUID collision detected during generation. "
+                    f"Aborting run so UUIDs can be regenerated."
+                )
+
 
         # upsert, then update sheet ONLY if upsert succeeds
         try:
@@ -574,10 +743,10 @@ def main():
             )
             processed_uuids = res["processed_uuids"]
 
-            print(f"[{target_table}]")
-            print(f"inserted: {res['inserted']}")
-            print(f"updated: {res['updated']}")
-            print(f"unchanged: {res['unchanged']}")
+            print(f"[{target_table}] Inserted: {res['inserted']}")
+            print(f"[{target_table}] Updated: {res['updated']}")
+            print(f"[{target_table}] Unchanged: {res['unchanged']}")
+
 
 
         except Exception as e:
@@ -600,14 +769,38 @@ def main():
                 update_count=res["updated"],
                 original_rows=rows
             )
-            print("Sheet updated. Proceeding to drop staging table")
-            # delete staging table
-            drop_table(eng, schema, staging_table)
+            print(f"[{target_table}] Sheet updated. Proceeding to drop staging table")
+
         except Exception as e:
             print("Sheet update failed")
             print("Error:", e)
             traceback.print_exc()
             return
+
+        try:
+            # delete staging table
+            drop_table(eng, schema, staging_table)
+
+            # detect deletions (rows removed from sheet)
+            sheet_uuids = processed_uuids
+
+            deletion_res = handle_deleted_rows(
+                eng,
+                schema,
+                target_table,
+                sheet_uuids
+            )
+
+            deleted_count = (deletion_res or {}).get("deleted", 0)
+
+            print(f"[{target_table}] Internal_uuid deleted: {deleted_count}")
+
+        except Exception as e:
+            print("Deletion handling failed AFTER sheet sync")
+            print("Error:", e)
+            traceback.print_exc()
+            return
+
 
 if __name__ == "__main__":
     main()
