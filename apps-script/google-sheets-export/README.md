@@ -1,11 +1,11 @@
 ## Vertion History 
 
-### 1.1
+### 1.1.0
 - deletion logging added
 - schema drift handling
 - new safety checks
 - tests added
 
-### 1.0
+### 1.0.0
 - functioning exporter script
 - tests
