@@ -1,4 +1,67 @@
-node_modules/
-.env
+# Putting a bunch just to be safe
+
+# OS / System
 .DS_Store
-apps-script/google-sheets-export/.secrets/service-account.json
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Environment_variables / Secrets
+.env
+.env.*
+*.env
+
+# API keys / service accounts
+*.json
+!package.json
+!tsconfig.json
+
+# keep explicitly tracked config if needed
+apps-script/google-sheets-export/.secrets/
+apps-script/google-sheets-export/.secrets/*
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Docker
+docker-compose.override.yml
+*.log
+logs/
+tmp/
+
+# local postgres volumes
+postgres_data/
+pgdata/
+*.db
+
+# Build / cache
+dist/
+build/
+.cache/
+*.egg-info/
+
+# Misc
+*.swp
+*.swo
