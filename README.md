@@ -1,3 +1,6 @@
+To cd into Bark-Worthy directory
+    cd BARK_HOME
+
 When terminal config gets reset for whatever reason:
     source ~/.zshrc
 
