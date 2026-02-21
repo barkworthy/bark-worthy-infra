@@ -71,13 +71,15 @@ def read_sheet(sheet_id, sheet_name):
     import time
     import random
 
-    for attempt in range(7):
+    for attempt in range(8):
         try:
             ws = gc.open_by_key(sheet_id).worksheet(sheet_name)
             rows = ws.get_all_records()
             return rows, ws
 
         except Exception as e:
+            print(f"[{sheet_name}] FULL ERROR:", repr(e))
+
             if "429" in str(e):
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 print(f"[{sheet_name}] Hit Google rate limit. Sleeping {wait:.1f}s then retrying...")
@@ -641,7 +643,18 @@ def main():
         # read header row (do NOT overwrite `rows`)
         header_row = worksheet.row_values(1)
 
-        clean_headers = [h.strip() for h in header_row]
+        clean_headers = [h.strip().lstrip("\ufeff") for h in header_row]
+
+        # ---- HARD GUARD: required system columns must exist ----
+        required_cols = {uuid_col, processed_col}
+        header_set = set(clean_headers)
+
+        missing = required_cols - header_set
+        if missing:
+            raise RuntimeError(
+                f"[{target_table}] Sheet missing required system columns: {missing}. "
+                "Aborting run before any DB writes."
+            )
 
         blank_cols = [i+1 for i,h in enumerate(clean_headers) if not h]
 

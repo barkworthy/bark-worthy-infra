@@ -9,7 +9,7 @@ MINOR
 Behavior or feature changes affecting runtime, outputs, or logic.
 
 PATCH
-Internal changes only (tests, refactors, docs, infra).
+Internal changes only (bug fixes, tests, refactors, docs, infra).
 
 ## Vertion History 
 
