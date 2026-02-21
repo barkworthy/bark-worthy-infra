@@ -646,7 +646,7 @@ def main():
         clean_headers = [h.strip().lstrip("\ufeff") for h in header_row]
 
         # ---- HARD GUARD: required system columns must exist ----
-        required_cols = {uuid_col, processed_col}
+        required_cols = {internal_uuid, processed_at}
         header_set = set(clean_headers)
 
         missing = required_cols - header_set
