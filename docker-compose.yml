@@ -38,7 +38,7 @@ services:
 
   sheets_exporter:
     build: ./apps-script/google-sheets-export
-    image: infra-sheets-exporter:1.0
+    image: infra-sheets-exporter:latest
     env_file:
       - ./.env
     working_dir: /app
