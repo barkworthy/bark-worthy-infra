@@ -646,7 +646,7 @@ def main():
         clean_headers = [h.strip().lstrip("\ufeff") for h in header_row]
 
         # ---- HARD GUARD: required system columns must exist ----
-        required_cols = {internal_uuid, processed_at}
+        required_cols = {uuid_col, processed_col}
         header_set = set(clean_headers)
 
         missing = required_cols - header_set
@@ -817,9 +817,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# make sure you cd into Infra
-# docker compose build sheets_exporter
-# docker compose run --rm sheets_exporter
-
-# to test: pytest -v
