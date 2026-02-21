@@ -1,5 +1,5 @@
-To cd into Bark-Worthy directory
-    cd BARK_HOME
+To make it so that `cd` brings you to /Bark-Worthy
+    load .zshrc
 
 When terminal config gets reset for whatever reason:
     source ~/.zshrc
