@@ -13,6 +13,9 @@ Internal changes only (bug fixes, tests, refactors, docs, infra).
 
 ## Version History
 
+### 1.3.0
+- renamed operating_expenses to non_sku_orders
+
 ### 1.2.2
 - mappings.yml hotfix
 
