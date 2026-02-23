@@ -16,12 +16,12 @@
   uuid_col: internal_uuid
   processed_col: processed_at
 
-- name: operating_expenses
+- name: non_sku_purchases
   sheet_id: "1QK8pN0gyuBm2sW_OkIn2O8Y-mzSxOAMn0yUX2pv8aOY"
-  sheet_name: "operating_expenses"
+  sheet_name: "non_sku_purchases"
   schema: google_sheets
-  target_table: operating_expenses
-  staging_table: operating_expenses_stg
+  target_table: non_sku_purchases
+  staging_table: non_sku_purchases_stg
   uuid_col: internal_uuid
   processed_col: processed_at
 
