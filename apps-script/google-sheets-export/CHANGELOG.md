@@ -1,17 +1,7 @@
-## Versioning
+## Changelog
 
-This project follows MAJOR.MINOR.PATCH.
-
-MAJOR
-Breaking or incompatible changes.
-
-MINOR
-Behavior or feature changes affecting runtime, outputs, or logic.
-
-PATCH
-Internal changes only (bug fixes, tests, refactors, docs, infra).
-
-## Version History
+### 1.4.0
+- removed sku_versions
 
 ### 1.3.0
 - renamed operating_expenses to non_sku_orders
