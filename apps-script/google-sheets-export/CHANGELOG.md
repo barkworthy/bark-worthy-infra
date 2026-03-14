@@ -1,5 +1,8 @@
 ## Changelog
 
+## 1.5.0
+- removed order_freebies table
+
 ### 1.4.0
 - removed sku_versions
 
