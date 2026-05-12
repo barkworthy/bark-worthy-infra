@@ -1,5 +1,9 @@
 ## Changelog
 
+## 1.6.0
+- added event_transactions
+- removed sku_pricing.minimun_quantity and sku_pricing.maximum_quantity
+
 ## 1.5.0
 - removed order_freebies table
 
